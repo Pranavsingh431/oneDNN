@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -25,6 +26,7 @@
 
 #include "common/c_types_map.hpp"
 
+#include "cpu/x64/ir/dump.hpp"
 #include "cpu/x64/ir/emitter/emitter.hpp"
 #include "cpu/x64/ir/ir.hpp"
 #include "cpu/x64/ir/postops_injector.hpp"
@@ -1255,6 +1257,177 @@ TEST(IntegrationTests, BinaryPostOpAddsPerElementRhs) {
         const float expected
                 = ref_dot(&a[r * simd_w()], b_data.data(), simd_w()) + rhs[r];
         EXPECT_FLOAT_EQ(c[r], expected) << "row " << r;
+    }
+}
+
+// Debug output tests
+//
+// Checks the `x64ir` debug output (see `ir/dump.hpp`): parsing the level from
+// an `ONEDNN_VERBOSE` value, the IR listing, and the framing of a kernel block.
+// None of them generates code, so they run on any machine and in builds
+// without dev mode.
+
+// Split `s` into lines, dropping the newline of each.
+std::vector<std::string> split_lines(const std::string &s) {
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t end = s.find('\n', pos);
+        lines.push_back(s.substr(pos, end - pos));
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return lines;
+}
+
+// Count the lines of `s` that contain `text`.
+int count_lines_with(const std::string &s, const std::string &text) {
+    int n = 0;
+    for (const std::string &line : split_lines(s))
+        if (line.find(text) != std::string::npos) n++;
+    return n;
+}
+
+TEST(DumpTests, ParsesLevelFromVerboseValue) {
+    EXPECT_EQ(parse_x64ir_level(""), 0);
+    EXPECT_EQ(parse_x64ir_level("x64ir=0"), 0);
+    EXPECT_EQ(parse_x64ir_level("x64ir=3"), 3);
+    // The token combines with other verbose tokens in any position.
+    EXPECT_EQ(parse_x64ir_level("dispatch,x64ir=2,debuginfo=1"), 2);
+    EXPECT_EQ(parse_x64ir_level("profile,x64ir=1"), 1);
+    // The last occurrence wins.
+    EXPECT_EQ(parse_x64ir_level("x64ir=1,x64ir=3"), 3);
+    EXPECT_EQ(parse_x64ir_level("x64ir=3,x64ir=1"), 1);
+    // Negative levels are clamped. Non-numeric text reads as 0.
+    EXPECT_EQ(parse_x64ir_level("x64ir=-2"), 0);
+    EXPECT_EQ(parse_x64ir_level("x64ir=abc"), 0);
+    // Only a token that starts with the key counts. `all` and `debuginfo=` do
+    // not enable the output.
+    EXPECT_EQ(parse_x64ir_level("xx64ir=3"), 0);
+    EXPECT_EQ(parse_x64ir_level("all"), 0);
+    EXPECT_EQ(parse_x64ir_level("debuginfo=255"), 0);
+}
+
+// An IR that covers the listing format: parameter loads, a mask, a forward
+// branch, a reg loop nested in an imm loop, converting and non-converting
+// accesses, a negative displacement, and post-ops with and without a base
+// pointer. The comments give the vreg and op indices the test expects.
+ir_t build_listing_ir() {
+    using namespace data_type;
+    ir_t ir;
+    const vreg_t ptr = ir.new_gpr(); // r0
+    const vreg_t n = ir.new_gpr(); // r1
+    const vreg_t acc = ir.new_vec(f32); // v2
+    const vreg_t x = ir.new_vec(f32); // v3
+    const vreg_t mask = ir.new_mask(); // m4
+    const vreg_t outer = ir.new_gpr(); // r5
+    const vreg_t inner = ir.new_gpr(); // r6
+    const vreg_t y = ir.new_vec(bf16); // v7
+    const label_t skip = ir.new_label(); // L0
+
+    ir.load_param(ptr, 8); // 0
+    ir.load_param(n, 16); // 1
+    ir.vzero(acc); // 2
+    ir.set_mask_imm(mask, 5); // 3
+    ir.jz(n, skip); // 4
+    const int outer_begin = ir.loop_begin_imm(outer, 2); // 5
+    const int inner_begin = ir.loop_begin_reg(inner, n); // 6
+    ir.vload(x, ptr, 0, bf16); // 7
+    ir.vdot(acc, x, x); // 8
+    ir.vload_masked(x, ptr, -64, mask, f32); // 9
+    ir.prefetch(ptr, 512); // 10
+    ir.add_imm(ptr, 64); // 11
+    ir.loop_end(inner, inner_begin); // 12
+    ir.loop_end(outer, outer_begin); // 13
+    ir.label(skip); // 14
+    ir.inject_postops({acc}, ptr, {0}); // 15
+    ir.inject_postops({acc, x}, vreg_t::none, {}); // 16
+    ir.vstore_masked(ptr, 0, acc, mask, f32); // 17
+    ir.vstore(ptr, 0, acc, bf16); // 18
+    ir.vload(y, ptr, 0, bf16); // 19
+    return ir;
+}
+
+// Checks the listing line by line rather than against one golden string, so a
+// failure names the operation whose text is wrong.
+TEST(DumpTests, ListsOperations) {
+    const ir_t ir = build_listing_ir();
+    const std::vector<std::string> lines = split_lines(to_string(ir));
+
+    // One line per vec data type, then one line per operation.
+    ASSERT_EQ((int)lines.size(), 2 + ir.n_ops());
+    EXPECT_EQ(lines[0], "; vec f32: v2-v3");
+    EXPECT_EQ(lines[1], "; vec bf16: v7");
+
+    // The operation index is right-aligned in five columns.
+    EXPECT_EQ(lines[2], "    0 | load r0, [param+8]");
+
+    // Text of operation `i` with the index column stripped, so the expected
+    // strings below show only the indentation and the operation.
+    const auto op = [&](int i) { return lines[2 + i].substr(8); };
+    EXPECT_EQ(op(1), "load r1, [param+16]");
+    EXPECT_EQ(op(2), "vzero v2");
+    EXPECT_EQ(op(3), "set_mask_imm m4, 5");
+    EXPECT_EQ(op(4), "jz r1, L0");
+    // A loop opens and closes at the same indentation. The body is indented
+    // one more level per enclosing loop.
+    EXPECT_EQ(op(5), "loop r5 = 2 {");
+    EXPECT_EQ(op(6), "  loop r6 = r1 {");
+    // A converting access names the data type in memory.
+    EXPECT_EQ(op(7), "    vload v3, bf16[r0+0]");
+    EXPECT_EQ(op(8), "    vdot v2, v3, v3");
+    EXPECT_EQ(op(9), "    vload_masked v3, [r0-64], m4");
+    EXPECT_EQ(op(10), "    prefetch [r0+512]");
+    EXPECT_EQ(op(11), "    add_imm r0, 64");
+    EXPECT_EQ(op(12), "  } // r6 -= 1, repeat while > 0");
+    EXPECT_EQ(op(13), "} // r5 -= 1, repeat while > 0");
+    EXPECT_EQ(op(14), "L0:");
+    EXPECT_EQ(op(15), "inject_postops v2, base=r0, off=[0]");
+    EXPECT_EQ(op(16), "inject_postops v2, v3");
+    EXPECT_EQ(op(17), "vstore_masked [r0+0], v2, m4");
+    EXPECT_EQ(op(18), "vstore bf16[r0+0], v2");
+    // A bf16 vreg moved to and from bf16 memory does not convert.
+    EXPECT_EQ(op(19), "vload v7, [r0+0]");
+}
+
+// Checks the framing of a kernel block and what each level adds. The
+// sequence number is passed in, so the expected text does not depend on how
+// many blocks the process printed before.
+TEST(DumpTests, FormatsKernelBlockByLevel) {
+    const ir_t ir = build_listing_ir();
+
+    kernel_dump_t info;
+    info.name = "test_kernel";
+    info.isa = avx2;
+    info.desc = "bcast_dim=4";
+    info.code_size = 123;
+    info.build_us = 1.5;
+    info.alloc_us = 2;
+    info.emit_us = 10.04;
+
+    for (int level : {1, 2, 3}) {
+        SCOPED_TRACE("level " + std::to_string(level));
+        const std::string s = format_kernel_dump(level, 7, info, ir);
+        const std::vector<std::string> lines = split_lines(s);
+        ASSERT_GE(lines.size(), 2u);
+
+        EXPECT_EQ(lines.front(), "x64ir: begin #7 test_kernel isa=avx2");
+        EXPECT_EQ(lines.back(), "x64ir: end #7");
+        // The block ends with a newline, so the next block starts on its own
+        // line.
+        EXPECT_EQ(s.back(), '\n');
+
+        EXPECT_EQ(lines[1], "; desc: bcast_dim=4");
+        EXPECT_EQ(lines[2],
+                "; ir: 20 ops, 8 vregs (gpr 4, vec 3, mask 1), 1 labels, 2 "
+                "loops, max depth 2");
+        EXPECT_EQ(lines[3], "; code: 123 bytes");
+        EXPECT_EQ(lines[4], "; time: build 1.5 us, alloc 2.0 us, emit 10.0 us");
+
+        // The listing appears at level 3 only.
+        const bool has_listing = s.find(to_string(ir)) != std::string::npos;
+        EXPECT_EQ(has_listing, level >= 3);
+        EXPECT_EQ(count_lines_with(s, " | "), level >= 3 ? ir.n_ops() : 0);
     }
 }
 

@@ -35,9 +35,11 @@
 #include "common/utils.hpp"
 #include "common/verbose.hpp"
 
+#include "cpu/x64/brgemm/brgemm_utils.hpp"
 #include "cpu/x64/brgemm/brgemv_ir.hpp"
 #include "cpu/x64/cpu_isa_traits.hpp"
 #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
+#include "cpu/x64/ir/dump.hpp"
 #include "cpu/x64/ir/emitter/emitter.hpp"
 #include "cpu/x64/ir/ir.hpp"
 #include "cpu/x64/ir/postops_injector.hpp"
@@ -558,9 +560,16 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
         : brgemm_kernel_t(jit_name(), abrg.isa_impl), brg_(abrg) {}
 
     void generate() override {
+        // Debug output (see `ir/dump.hpp`). At level 0 nothing is timed or
+        // formatted.
+        const int dump_level = ir::verbose_level();
+        ir::lap_timer_t timer(dump_level > 0);
+        ir::kernel_dump_t dump;
+
         // Build IR for non-transposed GEMV kernel
         ir::ir_t ir;
         nontrans::build_gemv(brg_, ir);
+        dump.build_us = timer.lap();
 
         // Scratch registers (2 gpr + 3 vec) reserved for spill code.
         const int gpr_scratch0 = 10, gpr_scratch1 = 11;
@@ -580,6 +589,7 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
 
         // Register allocation
         ir::reg_alloc_result_t alloc = allocate_registers(ir, reg_cfg.pools);
+        dump.alloc_us = timer.lap();
 
         // The injector is created here, not in the emitter, because it spans
         // the whole codegen flow (emits during `emit()`, writes its table after
@@ -611,6 +621,7 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
         // need to write down after the postamble.
         ir::data_section_t data;
         ir::emit(*this, ir, alloc, reg_cfg, data, postops_injector.get());
+        dump.emit_us = timer.lap();
 
         // Stack cleanup
         if (alloc.frame_bytes > 0) add(rsp, (uint32_t)alloc.frame_bytes);
@@ -623,6 +634,14 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
         // Emit the injector's constant table (a no-op unless the chain has
         // eltwise or sum).
         if (postops_injector) postops_injector->maybe_prepare_table();
+
+        if (dump_level > 0) {
+            dump.name = name();
+            dump.isa = brg_.isa_impl;
+            dump.desc = brgemm_utils::ir_dump_desc(brg_);
+            dump.code_size = getSize();
+            ir::print_kernel_dump(dump_level, dump, ir);
+        }
     }
 
 private:

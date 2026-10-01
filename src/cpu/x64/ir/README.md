@@ -144,6 +144,8 @@ today. A shared runner for the fixed part is a follow-up.
   each self-contained.
 * `postops_injector.hpp`, `postops_injector.cpp`: the driver for the JIT post-ops
   injector, which lowers the `inject_postops` operation.
+* `dump.hpp`, `dump.cpp`: the `x64ir` debug output, that is, the IR listing and
+  the per-kernel summary (see Debug Output).
 
 The kernel-specific builders live outside this directory. For example,
 `src/cpu/x64/brgemm/brgemv_ir.{hpp,cpp}` holds the GEMV builder and shows how
@@ -210,6 +212,87 @@ Additional rules to follow.
 
 The IR, allocator, and emitter have dedicated unit tests
 (`test_internals_cpu_ir`). IR-based kernels are also tested through benchdnn.
+
+## Debug Output
+
+A dev-mode build (`ONEDNN_DEV_MODE=ON`) prints what the pipeline did with each
+IR kernel it generates when `ONEDNN_VERBOSE` contains `x64ir=<level>`:
+
+```
+ONEDNN_VERBOSE=x64ir=3 ./benchdnn --matmul --dt=f32 64x256:256x1
+```
+
+The token combines with other `ONEDNN_VERBOSE` tokens, for example
+`ONEDNN_VERBOSE=dispatch,x64ir=1`. It is independent of `debuginfo=` and of
+`all`, and neither of them enables it. A build without dev mode ignores it. If
+the token is repeated, the last one wins.
+
+Levels are cumulative:
+
+| Level | Output |
+|---|---|
+| 1 | Summary: kernel name, ISA, descriptor fields, IR counts, total code size, and the time spent building the IR, allocating registers, and emitting code |
+| 2 | Nothing beyond level 1 yet |
+| 3 | The IR listing |
+
+Level 1 output for the command above:
+
+```
+x64ir: begin #1 jit_brgemv_ir_kernel_t isa=avx2
+; desc: bcast_dim=16 load_dim=1 reduce_dim=256 LDA=256 LDB=1 LDC=1 LDD=1 dt_a=f32 dt_b=f32 dt_c=f32 beta=0 type=brgemm_addr brgattr.max_bs=1 with_bias=0
+; ir: 66 ops, 19 vregs (gpr 8, vec 11, mask 0), 0 labels, 2 loops, max depth 2
+; code: 492 bytes
+; time: build 18.3 us, alloc 318.9 us, emit 73.2 us
+x64ir: end #1
+```
+
+The descriptor fields print under their `brgemm_desc_t` member names. They are
+not relabeled as M, N, and K, because that mapping does not hold for GEMV.
+
+The listing has one line per operation: the operation index, then the operation
+indented by loop depth. Lines starting with `; vec` give the data type of each
+vec vreg. Excerpt:
+
+```
+; vec f32: v4-v11 v16-v18
+    0 | load r0, [param+24]
+    ...
+    3 | loop r3 = 2 {
+    4 |   vzero v4
+    ...
+   17 |   loop r15 = 32 {
+   18 |     prefetch [r14+512]
+   19 |     vload v16, [r14+0]
+   ...
+   46 |   } // r15 -= 1, repeat while > 0
+```
+
+Operands are named as follows:
+
+* `r<id>`, `v<id>`, and `m<id>` are the gpr, vec, and mask vreg with id `<id>`.
+  Ids are shared by all kinds, so `v5` is vreg 5 in a debugger.
+* `[r<id>+<disp>]` is a memory operand, and `[param+<disp>]` reads the kernel
+  argument struct. A converting access is prefixed with the data type in memory,
+  for example `bf16[r3+0]`.
+* `L<id>` is a label.
+
+Each kernel prints one block with a single write, so blocks of kernels created
+concurrently do not interleave. The block starts with `x64ir: begin #<seq>` and
+ends with `x64ir: end #<seq>`. Extract the blocks with:
+
+```
+sed -n '/^x64ir: begin/,/^x64ir: end/p'
+```
+
+`<seq>` counts the blocks printed by the process. It is not the index in the
+`ONEDNN_JIT_DUMP` file names. To match a block to a dump file, compare the
+kernel name and the `; code:` size, which equals the file size. With
+`OMP_NUM_THREADS=1` the creation order is also deterministic.
+
+A block is printed only when a kernel is generated. A primitive-cache hit
+generates no kernel and prints nothing. When the IR kernel is not used for a
+problem, `ONEDNN_VERBOSE=dispatch` prints the reason in a `brgemm_ir` or
+`brgemv_ir` message.
 
 ## References
 

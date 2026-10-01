@@ -17,6 +17,8 @@
 #ifndef CPU_X64_BRGEMM_BRGEMM_UTILS_HPP
 #define CPU_X64_BRGEMM_BRGEMM_UTILS_HPP
 
+#include <string>
+
 #include "cpu/x64/brgemm/brgemm.hpp"
 
 #include "cpu/x64/cpu_isa_traits.hpp"
@@ -79,6 +81,12 @@ status_t init_brdgmm_conf(brgemm_desc_t *brg, cpu_isa_t isa,
         impl::data_type_t dt_b, brgemm_layout_t layout, float alpha, float beta,
         dim_t LDA, dim_t LDC, dim_t M, dim_t N,
         const brgemm_strides_t *strides = nullptr);
+
+/* Returns the descriptor fields an IR kernel prints in its `x64ir` debug
+ * output, as space-separated `name=value` pairs. Fields print under their
+ * member names, because the M, N, and K comments on `bcast_dim`, `load_dim`,
+ * and `reduce_dim` do not hold for GEMV. */
+std::string ir_dump_desc(const brgemm_desc_t &brg);
 
 } // namespace brgemm_utils
 

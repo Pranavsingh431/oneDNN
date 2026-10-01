@@ -31,7 +31,9 @@
 #include "common/verbose.hpp"
 
 #include "cpu/x64/brgemm/brgemm_ir.hpp"
+#include "cpu/x64/brgemm/brgemm_utils.hpp"
 #include "cpu/x64/cpu_isa_traits.hpp"
+#include "cpu/x64/ir/dump.hpp"
 #include "cpu/x64/ir/emitter/emitter.hpp"
 #include "cpu/x64/ir/ir.hpp"
 #include "cpu/x64/ir/reg_alloc.hpp"
@@ -660,8 +662,15 @@ struct jit_brgemm_ir_kernel_t : public brgemm_kernel_t {
         : brgemm_kernel_t(jit_name(), abrg.isa_impl), brg_(abrg) {}
 
     void generate() override {
+        // Debug output (see `ir/dump.hpp`). At level 0 nothing is timed or
+        // formatted.
+        const int dump_level = ir::verbose_level();
+        ir::lap_timer_t timer(dump_level > 0);
+        ir::kernel_dump_t dump;
+
         ir::ir_t ir;
         build_brgemm(brg_, ir);
+        dump.build_us = timer.lap();
 
         const int rsp_idx = Xbyak::Operand::RSP;
         const int param_idx = abi_param1.getIdx();
@@ -682,6 +691,7 @@ struct jit_brgemm_ir_kernel_t : public brgemm_kernel_t {
 
         const ir::reg_alloc_result_t alloc
                 = allocate_registers(ir, reg_cfg.pools);
+        dump.alloc_us = timer.lap();
 
         // `brgemm_ir_supported()` allows only a blocking that fits the vector
         // pool, so a vector spill means that check and the builder disagree
@@ -696,12 +706,21 @@ struct jit_brgemm_ir_kernel_t : public brgemm_kernel_t {
 
         ir::data_section_t data;
         ir::emit(*this, ir, alloc, reg_cfg, data, /*postops=*/nullptr);
+        dump.emit_us = timer.lap();
 
         if (alloc.frame_bytes > 0) add(rsp, (uint32_t)alloc.frame_bytes);
 
         postamble();
 
         ir::emit_data_section(*this, data);
+
+        if (dump_level > 0) {
+            dump.name = name();
+            dump.isa = brg_.isa_impl;
+            dump.desc = brgemm_utils::ir_dump_desc(brg_);
+            dump.code_size = getSize();
+            ir::print_kernel_dump(dump_level, dump, ir);
+        }
     }
 
 private:

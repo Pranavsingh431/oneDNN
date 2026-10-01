@@ -19,6 +19,8 @@
 
 #include "cpu/x64/cpu_isa_traits.hpp"
 
+#include "oneapi/dnnl/dnnl_debug.h"
+
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/nstl.hpp"
@@ -1291,6 +1293,27 @@ status_t init_brdgmm_conf(brgemm_desc_t *brg, cpu_isa_t isa,
     brg->load_dim = N;
 
     return status::success;
+}
+
+std::string ir_dump_desc(const brgemm_desc_t &brg) {
+    const char *type = "?";
+    switch (brg.type) {
+        case brgemm_batch_kind_undef: type = "brgemm_batch_kind_undef"; break;
+        case brgemm_addr: type = "brgemm_addr"; break;
+        case brgemm_offs: type = "brgemm_offs"; break;
+        case brgemm_strd: type = "brgemm_strd"; break;
+        case brgemm_static_offs: type = "brgemm_static_offs"; break;
+    }
+
+    ostringstream_t ss;
+    ss << "bcast_dim=" << brg.bcast_dim << " load_dim=" << brg.load_dim
+       << " reduce_dim=" << brg.reduce_dim << " LDA=" << brg.LDA
+       << " LDB=" << brg.LDB << " LDC=" << brg.LDC << " LDD=" << brg.LDD
+       << " dt_a=" << dnnl_dt2str(brg.dt_a) << " dt_b=" << dnnl_dt2str(brg.dt_b)
+       << " dt_c=" << dnnl_dt2str(brg.dt_c) << " beta=" << brg.beta
+       << " type=" << type << " brgattr.max_bs=" << brg.brgattr.max_bs
+       << " with_bias=" << brg.with_bias;
+    return ss.str();
 }
 
 } // namespace brgemm_utils
